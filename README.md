@@ -13,7 +13,6 @@
   <img src="https://img.shields.io/badge/Tauri-2-blue?logo=tauri" alt="Tauri 2" />
   <img src="https://img.shields.io/badge/Vue-3-42b883?logo=vuedotjs" alt="Vue 3" />
   <img src="https://img.shields.io/badge/Rust-ed8936?logo=rust&logoColor=white" alt="Rust" />
-  <img src="https://img.shields.io/badge/Canvas_2D-Pixel_Art-ff69b4" alt="Pixel Art" />
   <img src="https://img.shields.io/badge/macOS-supported-lightgrey?logo=apple" alt="macOS" />
 </p>
 
