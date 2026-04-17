@@ -13,7 +13,6 @@
   <img src="https://img.shields.io/badge/Tauri-2-blue?logo=tauri" alt="Tauri 2" />
   <img src="https://img.shields.io/badge/Vue-3-42b883?logo=vuedotjs" alt="Vue 3" />
   <img src="https://img.shields.io/badge/Rust-ed8936?logo=rust&logoColor=white" alt="Rust" />
-  <img src="https://img.shields.io/badge/Canvas_2D-Pixel_Art-ff69b4" alt="Pixel Art" />
   <img src="https://img.shields.io/badge/macOS-supported-lightgrey?logo=apple" alt="macOS" />
 </p>
 
@@ -108,7 +107,6 @@ pnpm tauri build
 │  ┌───────────────────────┐  │
 │  │ useClaudeEvents       │  │  ← 事件监听 → Pinia store + 35s 前端兜底
 │  │ useClaudeState        │  │  ← 休眠计时（5min idle → sleeping）
-│  │ PixelPet (Canvas 2D)  │  │  ← 48×48 像素画 → 4× 放大渲染
 │  └───────────────────────┘  │
 └─────────────────────────────┘
 ```
@@ -120,7 +118,6 @@ pnpm tauri build
 | 桌面框架 | Tauri 2 |
 | 后端 | Rust + Tokio |
 | 前端 | Vue 3 + TypeScript + Pinia |
-| 渲染 | Canvas 2D 像素画（程序化绘制） |
 | 样式 | UnoCSS |
 | 构建 | Vite 6 |
 | 规范 | Conventional Commits (commitlint + husky) |
