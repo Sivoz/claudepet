@@ -24,6 +24,10 @@ export interface ClaudeSession {
   state: PetState
   detail: string | null
   lastActivity: number
+  inputTokens: number
+  outputTokens: number
+  startedAt: number
+  model: string | null
 }
 
 export interface PermissionRequest {

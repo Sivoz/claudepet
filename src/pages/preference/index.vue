@@ -1,9 +1,19 @@
 <script setup lang="ts">
-import { ref, onMounted } from 'vue'
+import { ref, onMounted, onUnmounted } from 'vue'
 import { invoke } from '@tauri-apps/api/core'
-import { INVOKE_KEY } from '@/constant'
+import { emit, listen } from '@tauri-apps/api/event'
+import { INVOKE_KEY, EVENT_KEY } from '@/constant'
+import { useToastStore } from '@/stores/toast'
 
-const activeTab = ref<'appearance' | 'claude'>('appearance')
+const toastStore = useToastStore()
+
+interface HookStatus {
+  hookEnabled: boolean
+  pretoolHookEnabled: boolean
+  interceptActive: boolean
+}
+
+const activeTab = ref<'appearance' | 'claude' | 'advanced'>('appearance')
 
 // ---- Claude Code Hook ----
 const hookEnabled = ref(false)
@@ -13,14 +23,36 @@ const pretoolHookLoading = ref(false)
 const interceptActive = ref(false)
 const interceptLoading = ref(false)
 
+function broadcastHookStatus() {
+  emit(EVENT_KEY.HOOK_STATUS_CHANGED, {
+    hookEnabled: hookEnabled.value,
+    pretoolHookEnabled: pretoolHookEnabled.value,
+    interceptActive: interceptActive.value,
+  } as HookStatus)
+}
+
+let unlistenHookStatus: (() => void) | null = null
+
 onMounted(async () => {
   try {
     hookEnabled.value = await invoke<boolean>(INVOKE_KEY.CHECK_HOOK_STATUS)
     pretoolHookEnabled.value = await invoke<boolean>(INVOKE_KEY.CHECK_PRETOOLUSE_HOOK_STATUS)
     interceptActive.value = await invoke<boolean>(INVOKE_KEY.GET_INTERCEPT_ACTIVE)
   } catch (e) {
-    console.error('Failed to check hook status:', e)
+    toastStore.error(`获取 Hook 状态失败: ${e}`)
   }
+  await loadConfig()
+
+  // 监听其他窗口的状态变更
+  unlistenHookStatus = await listen<HookStatus>(EVENT_KEY.HOOK_STATUS_CHANGED, (e) => {
+    hookEnabled.value = e.payload.hookEnabled
+    pretoolHookEnabled.value = e.payload.pretoolHookEnabled
+    interceptActive.value = e.payload.interceptActive
+  })
+})
+
+onUnmounted(() => {
+  unlistenHookStatus?.()
 })
 
 async function toggleHook() {
@@ -33,8 +65,10 @@ async function toggleHook() {
       await invoke(INVOKE_KEY.INSTALL_NOTIFICATION_HOOK)
       hookEnabled.value = true
     }
+    broadcastHookStatus()
+    toastStore.success(hookEnabled.value ? '通知 Hook 已启用' : '通知 Hook 已关闭')
   } catch (e) {
-    console.error('Failed to toggle hook:', e)
+    toastStore.error(`切换 Hook 失败: ${e}`)
   } finally {
     hookLoading.value = false
   }
@@ -53,8 +87,10 @@ async function togglePretoolHook() {
       await invoke(INVOKE_KEY.INSTALL_PRETOOLUSE_HOOK)
       pretoolHookEnabled.value = true
     }
+    broadcastHookStatus()
+    toastStore.success(pretoolHookEnabled.value ? 'PreToolUse Hook 已安装' : 'PreToolUse Hook 已卸载')
   } catch (e) {
-    console.error('Failed to toggle pretool hook:', e)
+    toastStore.error(`切换 PreToolUse Hook 失败: ${e}`)
   } finally {
     pretoolHookLoading.value = false
   }
@@ -66,10 +102,20 @@ async function toggleIntercept() {
     const newVal = !interceptActive.value
     await invoke(INVOKE_KEY.SET_INTERCEPT_ACTIVE, { active: newVal })
     interceptActive.value = newVal
+    broadcastHookStatus()
+    toastStore.success(interceptActive.value ? '拦截模式已开启' : '拦截模式已关闭')
   } catch (e) {
-    console.error('Failed to toggle intercept:', e)
+    toastStore.error(`切换拦截模式失败: ${e}`)
   } finally {
     interceptLoading.value = false
+  }
+}
+
+async function openLogDir() {
+  try {
+    await invoke(INVOKE_KEY.OPEN_LOG_DIR)
+  } catch (e) {
+    toastStore.error(`打开日志目录失败: ${e}`)
   }
 }
 
@@ -113,6 +159,42 @@ function onSkinChange(key: string) {
   currentSkin.value = key
   invoke(INVOKE_KEY.SET_SKIN, { skin: key })
 }
+
+// ---- 配置中心 ----
+interface AppConfig {
+  idle_sleep_secs: number
+  session_window_secs: number
+  hook_timeout_secs: number
+  jsonl_debounce_ms: number
+  session_poll_fallback_secs: number
+  cursor_track_near_ms: number
+  cursor_track_far_ms: number
+}
+
+const appConfig = ref<AppConfig>({
+  idle_sleep_secs: 300,
+  session_window_secs: 600,
+  hook_timeout_secs: 120,
+  jsonl_debounce_ms: 300,
+  session_poll_fallback_secs: 30,
+  cursor_track_near_ms: 32,
+  cursor_track_far_ms: 150,
+})
+
+async function loadConfig() {
+  try {
+    appConfig.value = await invoke<AppConfig>(INVOKE_KEY.GET_CONFIG)
+  } catch { /* use defaults */ }
+}
+
+async function saveConfig() {
+  try {
+    await invoke(INVOKE_KEY.UPDATE_CONFIG, { newConfig: appConfig.value })
+    toastStore.success('配置已保存')
+  } catch (e) {
+    toastStore.error(`保存配置失败: ${e}`)
+  }
+}
 </script>
 
 <template>
@@ -134,6 +216,11 @@ function onSkinChange(key: string) {
         :class="{ active: activeTab === 'claude' }"
         @click="activeTab = 'claude'"
       >Claude Code</button>
+      <button
+        class="tab-item"
+        :class="{ active: activeTab === 'advanced' }"
+        @click="activeTab = 'advanced'"
+      >高级</button>
     </nav>
 
     <!-- 内容区 -->
@@ -233,6 +320,43 @@ function onSkinChange(key: string) {
         <div v-if="pretoolHookEnabled" class="hook-desc" style="margin-top: 8px">
           <p>安装 PreToolUse Hook 后，开启拦截模式可在宠物窗口中审批工具调用。</p>
           <p>关闭拦截模式时，所有工具调用自动放行（零延迟）。</p>
+        </div>
+
+        <div class="divider" />
+
+        <div class="section-label">调试</div>
+        <div class="row">
+          <span class="row-label">日志文件</span>
+          <button class="action-btn" @click="openLogDir">打开日志目录</button>
+        </div>
+        <div class="hook-desc">
+          <p>日志保存在 <code>~/.claude-pet/logs/</code>，按日滚动。</p>
+        </div>
+      </template>
+
+      <!-- 高级 Tab -->
+      <template v-if="activeTab === 'advanced'">
+        <div class="section-label">时间参数</div>
+        <div class="row">
+          <span class="row-label">空闲睡眠（秒）</span>
+          <input type="number" class="num-input" v-model.number="appConfig.idle_sleep_secs" min="30" max="3600" />
+        </div>
+        <div class="row">
+          <span class="row-label">Hook 超时（秒）</span>
+          <input type="number" class="num-input" v-model.number="appConfig.hook_timeout_secs" min="10" max="600" />
+        </div>
+        <div class="row">
+          <span class="row-label">会话窗口（秒）</span>
+          <input type="number" class="num-input" v-model.number="appConfig.session_window_secs" min="60" max="3600" />
+        </div>
+
+        <div class="divider" />
+        <div class="hook-desc">
+          <p>更多参数可直接编辑 <code>~/.claude-pet/config.toml</code></p>
+        </div>
+        <div class="row" style="margin-top: 12px">
+          <span></span>
+          <button class="action-btn save-btn" @click="saveConfig">保存配置</button>
         </div>
       </template>
 
@@ -431,6 +555,43 @@ function onSkinChange(key: string) {
   color: rgba(255,255,255,0.3);
   line-height: 1.6;
 }
+/* 操作按钮 */
+.action-btn {
+  padding: 4px 12px;
+  border-radius: 6px;
+  font-size: 12px;
+  border: 1px solid rgba(255,255,255,0.15);
+  background: rgba(255,255,255,0.06);
+  color: rgba(255,255,255,0.7);
+  cursor: pointer;
+  transition: all 0.15s;
+}
+/* 数字输入 */
+.num-input {
+  width: 70px;
+  background: rgba(255,255,255,0.08);
+  border: 1px solid rgba(255,255,255,0.12);
+  border-radius: 6px;
+  color: inherit;
+  padding: 4px 8px;
+  font-size: 12px;
+  outline: none;
+  text-align: right;
+}
+.num-input:focus {
+  border-color: rgba(255,255,255,0.25);
+}
+.save-btn {
+  background: rgba(74,222,128,0.15);
+  border-color: rgba(74,222,128,0.3);
+  color: #4ade80;
+}
+
+.action-btn:hover {
+  background: rgba(255,255,255,0.12);
+  border-color: rgba(255,255,255,0.25);
+}
+
 .hook-desc code {
   color: rgba(255,255,255,0.5);
 }

@@ -846,6 +846,8 @@ export class PixelPet {
   private scale: number
   private _mirror = false
   private _opacity = 1
+  /** 帧缓存：key = `${skin}-${state}-${frameIndex}` */
+  private frameCache = new Map<string, ImageBitmap>()
 
   constructor(container: HTMLElement, scale = 4) {
     this.scale = scale
@@ -855,7 +857,9 @@ export class PixelPet {
     this.canvas = document.createElement('canvas')
     this.canvas.width = W
     this.canvas.height = W
-    this.ctx = this.canvas.getContext('2d')!
+    const ctx = this.canvas.getContext('2d')
+    if (!ctx) throw new Error('Failed to get 2d context for offscreen canvas')
+    this.ctx = ctx
 
     // 显示 canvas (放大后)
     this.displayCanvas = document.createElement('canvas')
@@ -866,7 +870,9 @@ export class PixelPet {
     this.displayCanvas.style.imageRendering = 'pixelated'
     container.appendChild(this.displayCanvas)
 
-    this.displayCtx = this.displayCanvas.getContext('2d')!
+    const displayCtx = this.displayCanvas.getContext('2d')
+    if (!displayCtx) throw new Error('Failed to get 2d context for display canvas')
+    this.displayCtx = displayCtx
     this.displayCtx.imageSmoothingEnabled = false
 
     this.startLoop()
@@ -900,16 +906,41 @@ export class PixelPet {
 
   getScale() { return this.scale }
 
+  /** 清除帧缓存（换皮肤时可调用，但通常不需要因为 key 包含 skin） */
+  clearCache() {
+    this.frameCache.forEach((bmp) => bmp.close())
+    this.frameCache.clear()
+  }
+
   private startLoop() {
     const tick = () => {
       this.frame++
       const sf = Math.floor(this.frame / 12)
       const skin = SKINS[this._skin]
-      if (skin) {
+      if (!skin) {
+        this.animId = requestAnimationFrame(tick)
+        return
+      }
+
+      const cacheKey = `${this._skin}-${this._state}-${sf}`
+      const cached = this.frameCache.get(cacheKey)
+      const dsz = Math.round(W * this.scale)
+
+      if (cached) {
+        // 缓存命中：直接绘制 ImageBitmap
+        this.displayCtx.clearRect(0, 0, dsz, dsz)
+        if (this._mirror) {
+          this.displayCtx.save()
+          this.displayCtx.scale(-1, 1)
+          this.displayCtx.drawImage(cached, -dsz, 0, dsz, dsz)
+          this.displayCtx.restore()
+        } else {
+          this.displayCtx.drawImage(cached, 0, 0, dsz, dsz)
+        }
+      } else {
+        // 缓存未命中：绘制到离屏 canvas，然后缓存
         skin.draw(this.ctx, sf, this._state)
-        // 叠加状态特效
         drawStateEffects(this.ctx, sf, this._state)
-        const dsz = Math.round(W * this.scale)
         this.displayCtx.clearRect(0, 0, dsz, dsz)
         if (this._mirror) {
           this.displayCtx.save()
@@ -919,7 +950,21 @@ export class PixelPet {
         } else {
           this.displayCtx.drawImage(this.canvas, 0, 0, dsz, dsz)
         }
+        // 异步缓存 ImageBitmap（不阻塞渲染）
+        createImageBitmap(this.canvas).then((bmp) => {
+          // 限制缓存大小（8 skins × 7 states × ~20 frames ≈ 1120 entries）
+          if (this.frameCache.size > 1200) {
+            // 清除一半旧缓存
+            const keys = [...this.frameCache.keys()]
+            for (let i = 0; i < keys.length / 2; i++) {
+              this.frameCache.get(keys[i])?.close()
+              this.frameCache.delete(keys[i])
+            }
+          }
+          this.frameCache.set(cacheKey, bmp)
+        })
       }
+
       this.animId = requestAnimationFrame(tick)
     }
     this.animId = requestAnimationFrame(tick)
@@ -927,6 +972,7 @@ export class PixelPet {
 
   destroy() {
     cancelAnimationFrame(this.animId)
+    this.clearCache()
     this.displayCanvas.remove()
   }
 }

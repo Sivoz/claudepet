@@ -47,10 +47,11 @@ ClaudePet 是一个悬浮在所有窗口之上的桌面像素宠物。它通过�
 |:---|:---|:---|
 | 发送 prompt | 🔵 思考中 | 蓝色气泡 + 旋转光点 |
 | 调用工具 / 生成代码 | 🟢 编码中 | 绿色代码括号 |
-| 回复结束 | 🟡 已完成 | 金色星光（3s 后回到空闲） |
+| 回复结束 (`end_turn` / `max_tokens`) | 🟡 已完成 | 金色星光（3s 后回到空闲） |
 | 工具报错 | 🔴 出错了 | 红色闪烁 |
 | 等待审批 | 🟠 等待中 | 橙色光晕 |
 | 5 分钟无活动 | 🟣 休眠中 | 紫色 Z 字符 |
+| 30 秒无新事件（异常中断） | ⚪ 自动回空闲 | Watchdog 超时兜底 |
 
 **🖥️ 多屏 & 多 Space 支持** — 自动跟随鼠标所在屏幕，四指滑动切换桌面时始终可见
 
@@ -95,8 +96,9 @@ pnpm tauri build
 │  ┌───────────────────────┐  │
 │  │ notify + debouncer    │  │  ← 文件监听（300ms 防抖）
 │  │ IncrementalParser     │  │  ← 增量解析（字节偏移 + 半行缓冲）
-│  │ resolve_state()       │  │  ← JSONL → PetState 映射
+│  │ resolve_state()       │  │  ← JSONL → PetState 映射（stop_reason 感知）
 │  │ SessionManager        │  │  ← 多会话追踪
+│  │ Watchdog (tokio)      │  │  ← 30s 活跃状态超时兜底
 │  └───────────┬───────────┘  │
 │              │ emit          │
 └──────────────┼──────────────┘
@@ -104,7 +106,7 @@ pnpm tauri build
 ┌─────────────────────────────┐
 │  Vue 3 Frontend             │
 │  ┌───────────────────────┐  │
-│  │ useClaudeEvents       │  │  ← 事件监听 → Pinia store
+│  │ useClaudeEvents       │  │  ← 事件监听 → Pinia store + 35s 前端兜底
 │  │ useClaudeState        │  │  ← 休眠计时（5min idle → sleeping）
 │  │ PixelPet (Canvas 2D)  │  │  ← 48×48 像素画 → 4× 放大渲染
 │  └───────────────────────┘  │

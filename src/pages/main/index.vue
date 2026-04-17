@@ -46,10 +46,18 @@ const stateConfig: Record<PetState, { label: string; color: string; dot: string 
   sleeping: { label: '休眠中',   color: '#c4b5fd', dot: '#a78bfa' },
 }
 
-/** 只显示未隐藏的会话 */
-const visibleSessions = computed(() =>
-  claudeStore.sessions.filter((s) => claudeStore.isSessionVisible(s.id)),
-)
+/** 只显示未隐藏的会话，同项目名只保留最近活跃的那个 */
+const visibleSessions = computed(() => {
+  const visible = claudeStore.sessions.filter((s) => claudeStore.isSessionVisible(s.id))
+  const byProject = new Map<string, typeof visible[0]>()
+  for (const s of visible) {
+    const existing = byProject.get(s.projectName)
+    if (!existing || s.lastActivity > existing.lastActivity) {
+      byProject.set(s.projectName, s)
+    }
+  }
+  return [...byProject.values()].sort((a, b) => b.lastActivity - a.lastActivity)
+})
 
 const hasPending = computed(() => claudeStore.pendingPermissions.length > 0)
 
@@ -71,6 +79,14 @@ function stateOf(state: PetState) {
   return stateConfig[state] || stateConfig.idle
 }
 
+/** token 数量格式化：K=千, W=万, 依次类推 */
+function formatTokens(n: number): string {
+  if (n >= 1_0000_0000) return `${(n / 1_0000_0000).toFixed(1)}Y`
+  if (n >= 1_0000) return `${(n / 1_0000).toFixed(1)}W`
+  if (n >= 1000) return `${(n / 1000).toFixed(1)}K`
+  return `${n}`
+}
+
 async function startDrag() {
   await appWindow.startDragging()
 }
@@ -78,6 +94,10 @@ async function startDrag() {
 async function onContextMenu(e: MouseEvent) {
   e.preventDefault()
   await invoke('show_context_menu')
+}
+
+async function onDoubleClick() {
+  await invoke('open_status_panel')
 }
 </script>
 
@@ -141,8 +161,19 @@ async function onContextMenu(e: MouseEvent) {
         id="pet-canvas"
         class="pet-area"
         @mousedown.left="startDrag"
+        @dblclick="onDoubleClick"
         @contextmenu="onContextMenu"
       />
+
+      <!-- Token 消耗计数（紧贴宠物脚下） -->
+      <div
+        v-if="claudeStore.totalTokens > 0"
+        class="token-counter pointer-events-auto"
+        :style="{ opacity: catStore.opacity }"
+        @click="claudeStore.resetTokens()"
+      >
+        {{ formatTokens(claudeStore.totalTokens) }}
+      </div>
 
       <!-- 待审批快捷条（宠物下方） -->
       <div v-if="hasPending" class="approval-bar">
@@ -151,7 +182,7 @@ async function onContextMenu(e: MouseEvent) {
           :key="perm.requestId"
           class="approval-item"
         >
-          <span class="approval-tool">{{ perm.toolName }}</span>
+          <span class="approval-tool">{{ perm.toolName }}<template v-if="perm.toolInput">: {{ perm.toolInput }}</template></span>
           <button class="btn-approve" @click="approve(perm.requestId)">&#10003;</button>
           <button class="btn-deny" @click="deny(perm.requestId)">&#10005;</button>
         </div>
@@ -245,6 +276,23 @@ async function onContextMenu(e: MouseEvent) {
 @keyframes float {
   0%, 100% { transform: translateY(0); }
   50% { transform: translateY(-6px); }
+}
+
+/* Token 计数器 — 紧贴宠物脚下 */
+.token-counter {
+  margin-top: -30px;
+  font-size: 10px;
+  font-weight: 600;
+  color: #c4b5fd;
+  cursor: pointer;
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif;
+  text-shadow: 0 1px 3px rgba(0,0,0,0.8);
+  letter-spacing: 0.5px;
+  white-space: nowrap;
+  line-height: 1;
+}
+.token-counter:hover {
+  color: #e2d9f3;
 }
 
 /* 待审批快捷条 */

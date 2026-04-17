@@ -17,6 +17,6 @@
     "core:tray:default",
     "core:menu:default",
     "core:event:default",
-    "log:default"
+    "notification:default"
   ]
 }

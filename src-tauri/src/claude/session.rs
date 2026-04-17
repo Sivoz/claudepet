@@ -14,6 +14,10 @@ pub struct SessionInfo {
     pub state: String,
     pub detail: Option<String>,
     pub last_activity: u64,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub started_at: u64,
+    pub model: Option<String>,
 }
 
 /// 会话管理器：追踪所有活跃的 Claude Code 会话
@@ -85,6 +89,10 @@ impl SessionManager {
                         state: "idle".to_string(),
                         detail: None,
                         last_activity,
+                        input_tokens: 0,
+                        output_tokens: 0,
+                        started_at: last_activity,
+                        model: None,
                     },
                 );
             }
@@ -98,6 +106,9 @@ impl SessionManager {
         state: &str,
         detail: Option<String>,
         file_path: &Path,
+        input_tokens: Option<u64>,
+        output_tokens: Option<u64>,
+        model: Option<String>,
     ) {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -108,6 +119,15 @@ impl SessionManager {
             session.state = state.to_string();
             session.detail = detail;
             session.last_activity = now;
+            if let Some(t) = input_tokens {
+                session.input_tokens += t;
+            }
+            if let Some(t) = output_tokens {
+                session.output_tokens += t;
+            }
+            if model.is_some() {
+                session.model = model;
+            }
         } else {
             // 新会话：从文件路径推导项目信息
             let (project_name, project_path) = extract_project_info(file_path);
@@ -122,6 +142,10 @@ impl SessionManager {
                     state: state.to_string(),
                     detail,
                     last_activity: now,
+                    input_tokens: input_tokens.unwrap_or(0),
+                    output_tokens: output_tokens.unwrap_or(0),
+                    started_at: now,
+                    model,
                 },
             );
         }
@@ -173,6 +197,7 @@ pub fn extract_session_id_from_path(path: &Path) -> Option<String> {
 }
 
 /// 从 .jsonl 文件路径中提取项目信息
+#[allow(dead_code)]
 fn extract_project_info(file_path: &Path) -> (String, String) {
     if let Some(parent) = file_path.parent() {
         let folder_name = parent
@@ -183,5 +208,100 @@ fn extract_project_info(file_path: &Path) -> (String, String) {
         (project_name, folder_name)
     } else {
         ("unknown".to_string(), String::new())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn decode_project_name_extracts_last_segment() {
+        assert_eq!(
+            decode_project_name("-Users-sivo-PycharmProjects-ClaudePet"),
+            "ClaudePet"
+        );
+    }
+
+    #[test]
+    fn decode_project_name_single_segment() {
+        assert_eq!(decode_project_name("myproject"), "myproject");
+    }
+
+    #[test]
+    fn extract_session_id_valid_uuid() {
+        let path = Path::new("/foo/bar/a1b2c3d4-e5f6-7890-abcd-ef1234567890.jsonl");
+        assert_eq!(
+            extract_session_id_from_path(path),
+            Some("a1b2c3d4-e5f6-7890-abcd-ef1234567890".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_session_id_invalid_format() {
+        let path = Path::new("/foo/bar/not-a-uuid.jsonl");
+        assert_eq!(extract_session_id_from_path(path), None);
+    }
+
+    #[test]
+    fn session_manager_update_and_get() {
+        let mut mgr = SessionManager::new();
+        let path = Path::new("/projects/-Users-sivo-test/abc12345-1234-5678-9abc-def012345678.jsonl");
+
+        mgr.update_session(
+            "abc12345-1234-5678-9abc-def012345678",
+            "coding",
+            Some("Read".to_string()),
+            path,
+            Some(100),
+            Some(50),
+            Some("claude-sonnet-4-5-20250514".to_string()),
+        );
+
+        let sessions = mgr.get_active_sessions();
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].state, "coding");
+        assert_eq!(sessions[0].input_tokens, 100);
+        assert_eq!(sessions[0].output_tokens, 50);
+    }
+
+    #[test]
+    fn session_manager_accumulates_tokens() {
+        let mut mgr = SessionManager::new();
+        let path = Path::new("/projects/test/abc12345-1234-5678-9abc-def012345678.jsonl");
+        let sid = "abc12345-1234-5678-9abc-def012345678";
+
+        mgr.update_session(sid, "coding", None, path, Some(100), Some(50), None);
+        mgr.update_session(sid, "thinking", None, path, Some(200), Some(100), None);
+
+        let sessions = mgr.get_active_sessions();
+        assert_eq!(sessions[0].input_tokens, 300);
+        assert_eq!(sessions[0].output_tokens, 150);
+    }
+
+    #[test]
+    fn session_manager_filters_stale_sessions() {
+        let mut mgr = SessionManager::new();
+
+        // 手动插入一个过期会话（last_activity 设为 0 = 1970）
+        mgr.sessions.insert(
+            "old-session".to_string(),
+            SessionInfo {
+                session_id: "old-session".to_string(),
+                project_name: "old".to_string(),
+                project_path: "old".to_string(),
+                file_path: "/tmp/old.jsonl".to_string(),
+                state: "idle".to_string(),
+                detail: None,
+                last_activity: 0,
+                input_tokens: 0,
+                output_tokens: 0,
+                started_at: 0,
+                model: None,
+            },
+        );
+
+        let sessions = mgr.get_active_sessions();
+        assert!(sessions.is_empty(), "stale session should be filtered out");
     }
 }

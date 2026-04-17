@@ -18,6 +18,11 @@ const router = createRouter({
       name: 'preference',
       component: () => import('./pages/preference/index.vue'),
     },
+    {
+      path: '/status',
+      name: 'status',
+      component: () => import('./pages/status/index.vue'),
+    },
   ],
 })
 

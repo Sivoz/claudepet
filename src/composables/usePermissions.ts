@@ -1,12 +1,20 @@
 import { invoke } from '@tauri-apps/api/core'
 import { INVOKE_KEY } from '@/constant'
 import { useClaudeStore } from '@/stores/claude'
+import { useToastStore } from '@/stores/toast'
 
 /**
  * 权限审批操作
  */
 export function usePermissions() {
   const claudeStore = useClaudeStore()
+  const toastStore = useToastStore()
+
+  function restoreFromWaiting() {
+    if (claudeStore.petState === 'waiting' && claudeStore.pendingPermissions.length === 0) {
+      claudeStore.setPetState('idle')
+    }
+  }
 
   async function approve(requestId: string) {
     try {
@@ -15,8 +23,9 @@ export function usePermissions() {
         decision: 'allow',
       })
       claudeStore.removePermission(requestId)
+      restoreFromWaiting()
     } catch (e) {
-      console.error('Failed to approve permission:', e)
+      toastStore.error(`审批失败: ${e}`)
     }
   }
 
@@ -27,8 +36,9 @@ export function usePermissions() {
         decision: 'deny',
       })
       claudeStore.removePermission(requestId)
+      restoreFromWaiting()
     } catch (e) {
-      console.error('Failed to deny permission:', e)
+      toastStore.error(`拒绝失败: ${e}`)
     }
   }
 

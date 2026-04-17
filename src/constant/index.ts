@@ -20,6 +20,16 @@ export const INVOKE_KEY = {
   CHECK_PRETOOLUSE_HOOK_STATUS: 'check_pretooluse_hook_status',
   SET_INTERCEPT_ACTIVE: 'set_intercept_active',
   GET_INTERCEPT_ACTIVE: 'get_intercept_active',
+  CHECK_CLAUDE_CLI: 'check_claude_cli',
+  CLAUDE_ASK: 'claude_ask',
+  RESIZE_WINDOW: 'resize_window',
+  OPEN_LOG_DIR: 'open_log_dir',
+  VERIFY_HOOK_INTEGRITY: 'verify_hook_integrity',
+  GET_CONFIG: 'get_config',
+  UPDATE_CONFIG: 'update_config',
+  READ_RECENT_LOGS: 'read_recent_logs',
+  COLLECT_DIAGNOSTICS: 'collect_diagnostics',
+  CHECK_HEALTH: 'check_health',
 } as const
 
 /** Tauri 事件名称 */
@@ -29,4 +39,7 @@ export const EVENT_KEY = {
   CLAUDE_SESSION_STARTED: 'claude-session-started',
   CLAUDE_SESSION_ENDED: 'claude-session-ended',
   PERMISSION_REQUEST: 'permission-request',
+  HOOK_STATUS_CHANGED: 'hook-status-changed',
+  SESSION_CHANGED: 'session-changed',
+  CONFIG_CHANGED: 'config-changed',
 } as const

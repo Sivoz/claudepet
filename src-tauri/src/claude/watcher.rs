@@ -1,6 +1,6 @@
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use notify::RecursiveMode;
 use notify_debouncer_mini::{new_debouncer, DebounceEventResult, Debouncer};
@@ -9,7 +9,24 @@ use tauri::Emitter;
 use crate::claude::parser::IncrementalParser;
 use crate::claude::session::{self, SessionManager};
 use crate::claude::settings;
-use crate::claude::{resolve_state, PetEvent};
+use crate::claude::state_machine::StateMachine;
+use crate::claude::{resolve_state, PetEvent, PetState};
+use crate::config::SharedConfig;
+
+/// Watchdog 状态：追踪最后事件时间和当前状态，用于超时兜底
+pub struct WatchdogState {
+    pub current: PetState,
+    pub last_event_at: Instant,
+}
+
+impl WatchdogState {
+    pub fn new() -> Self {
+        Self {
+            current: PetState::Idle,
+            last_event_at: Instant::now(),
+        }
+    }
+}
 
 /// 获取 Claude projects 目录
 fn claude_projects_dir() -> Option<PathBuf> {
@@ -28,6 +45,7 @@ fn project_name_from_path(path: &Path) -> Option<String> {
 pub fn start_watching(
     app_handle: tauri::AppHandle,
     session_manager: Arc<Mutex<SessionManager>>,
+    config: SharedConfig,
 ) -> anyhow::Result<Debouncer<notify::RecommendedWatcher>> {
     let projects_dir = claude_projects_dir()
         .ok_or_else(|| anyhow::anyhow!("Cannot find home directory"))?;
@@ -37,17 +55,65 @@ pub fn start_watching(
     }
 
     let parser = Arc::new(Mutex::new(IncrementalParser::new()));
+    let state_machine = Arc::new(Mutex::new(StateMachine::new()));
+    let watchdog = Arc::new(Mutex::new(WatchdogState::new()));
+
+    // 启动 watchdog 定时任务
+    {
+        let watchdog = Arc::clone(&watchdog);
+        let app = app_handle.clone();
+        let config = Arc::clone(&config);
+        tauri::async_runtime::spawn(async move {
+            let mut ticker = tokio::time::interval(Duration::from_secs(5));
+            loop {
+                ticker.tick().await;
+                let timeout_secs = config
+                    .read()
+                    .map(|c| c.active_state_timeout_secs)
+                    .unwrap_or(30);
+                let timeout = Duration::from_secs(timeout_secs);
+
+                let should_reset = {
+                    let wd = watchdog.lock().unwrap();
+                    matches!(wd.current, PetState::Thinking | PetState::Coding)
+                        && wd.last_event_at.elapsed() > timeout
+                };
+
+                if should_reset {
+                    let elapsed = watchdog.lock().unwrap().last_event_at.elapsed();
+                    tracing::info!(
+                        elapsed_secs = elapsed.as_secs(),
+                        "active state timeout, reverting to idle"
+                    );
+                    watchdog.lock().unwrap().current = PetState::Idle;
+
+                    let pet_event = PetEvent {
+                        state: "idle".to_string(),
+                        session_id: None,
+                        project_name: None,
+                        detail: Some("watchdog_timeout".to_string()),
+                        input_tokens: None,
+                        output_tokens: None,
+                        model: None,
+                    };
+                    let _ = app.emit("claude-event", &pet_event);
+                }
+            }
+        });
+    }
+
     let app = app_handle;
 
     let (tx, rx) = std::sync::mpsc::channel::<DebounceEventResult>();
 
     // 后台线程处理文件变更事件
+    let watchdog_for_thread = Arc::clone(&watchdog);
     std::thread::spawn(move || {
         while let Ok(result) = rx.recv() {
             let events = match result {
                 Ok(events) => events,
                 Err(e) => {
-                    log::warn!("Watcher error: {:?}", e);
+                    tracing::warn!("Watcher error: {:?}", e);
                     continue;
                 }
             };
@@ -71,16 +137,47 @@ pub fn start_watching(
                     if let Some(state) = resolve_state(entry) {
                         let detail = extract_detail(entry);
 
+                        // 提取 token 用量
+                        let (input_tokens, output_tokens) = entry
+                            .message
+                            .as_ref()
+                            .and_then(|m| m.usage.as_ref())
+                            .map(|u| (u.input_tokens, u.output_tokens))
+                            .unwrap_or((None, None));
+
+                        // 提取模型名
+                        let model = entry
+                            .message
+                            .as_ref()
+                            .and_then(|m| m.model.clone());
+
                         // 确定 session_id：优先用 entry 中的，否则从文件名提取
                         let session_id = entry
                             .session_id
                             .clone()
                             .or_else(|| session::extract_session_id_from_path(path));
 
-                        // 更新会话管理器
+                        // 更新会话管理器，并推送会话列表变更
                         if let Some(sid) = &session_id {
                             let mut mgr = session_manager.lock().unwrap();
-                            mgr.update_session(sid, state.as_str(), detail.clone(), path);
+                            mgr.update_session(
+                                sid, state.as_str(), detail.clone(), path,
+                                input_tokens, output_tokens, model.clone(),
+                            );
+                            let sessions = mgr.get_active_sessions();
+                            drop(mgr); // 释放锁后再 emit
+                            let _ = app.emit("session-changed", &sessions);
+                        }
+
+                        // 通过状态机校验转移合法性
+                        if let Ok(mut sm) = state_machine.lock() {
+                            sm.transition(state.clone());
+                        }
+
+                        // 更新 watchdog 状态
+                        if let Ok(mut wd) = watchdog_for_thread.lock() {
+                            wd.current = state.clone();
+                            wd.last_event_at = Instant::now();
                         }
 
                         let pet_event = PetEvent {
@@ -88,10 +185,13 @@ pub fn start_watching(
                             session_id,
                             project_name: project_name.clone(),
                             detail,
+                            input_tokens,
+                            output_tokens,
+                            model,
                         };
 
                         if let Err(e) = app.emit("claude-event", &pet_event) {
-                            log::error!("Failed to emit claude-event: {}", e);
+                            tracing::error!("Failed to emit claude-event: {}", e);
                         }
                     }
                 }
@@ -106,7 +206,7 @@ pub fn start_watching(
         .watcher()
         .watch(&projects_dir, RecursiveMode::Recursive)?;
 
-    log::info!("Watching Claude projects at {:?}", projects_dir);
+    tracing::info!("Watching Claude projects at {:?}", projects_dir);
 
     Ok(debouncer)
 }
@@ -132,7 +232,7 @@ pub fn start_signal_watching(
             let events = match result {
                 Ok(events) => events,
                 Err(e) => {
-                    log::warn!("Signal watcher error: {:?}", e);
+                    tracing::warn!("Signal watcher error: {:?}", e);
                     continue;
                 }
             };
@@ -144,12 +244,15 @@ pub fn start_signal_watching(
                         session_id: None,
                         project_name: None,
                         detail: Some("permission_prompt".to_string()),
+                        input_tokens: None,
+                        output_tokens: None,
+                        model: None,
                     };
 
                     if let Err(e) = app.emit("claude-event", &pet_event) {
-                        log::error!("Failed to emit waiting event: {}", e);
+                        tracing::error!("Failed to emit waiting event: {}", e);
                     }
-                    log::info!("Permission prompt detected, pet state -> waiting");
+                    tracing::info!("Permission prompt detected, pet state -> waiting");
                 }
             }
         }
@@ -161,7 +264,7 @@ pub fn start_signal_watching(
         .watcher()
         .watch(&dir, RecursiveMode::NonRecursive)?;
 
-    log::info!("Watching signal file at {:?}", dir);
+    tracing::info!("Watching signal file at {:?}", dir);
 
     Ok(debouncer)
 }

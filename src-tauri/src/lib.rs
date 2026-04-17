@@ -1,5 +1,9 @@
 mod claude;
 mod commands;
+mod config;
+mod health;
+mod logging;
+mod notifications;
 
 use std::sync::{Arc, Mutex};
 
@@ -10,6 +14,7 @@ use tauri::{
     tray::TrayIconEvent,
 };
 
+use claude::ipc::PendingRequests;
 use claude::session::SessionManager;
 use commands::WatcherState;
 
@@ -20,7 +25,7 @@ fn handle_menu_event(app: &tauri::AppHandle, event_id: &str) {
     if let Some(skin_key) = event_id.strip_prefix("skin_") {
         if let Some(w) = &window {
             let _ = w.emit("change-skin", skin_key.to_string());
-            log::info!("Skin changed to: {}", skin_key);
+            tracing::info!("Skin changed to: {}", skin_key);
         }
         return;
     }
@@ -31,7 +36,7 @@ fn handle_menu_event(app: &tauri::AppHandle, event_id: &str) {
             commands::CURRENT_SIZE_PCT.store(pct, std::sync::atomic::Ordering::Relaxed);
             if let Some(w) = &window {
                 let _ = w.emit("change-scale", pct);
-                log::info!("Scale changed to: {}%", pct);
+                tracing::info!("Scale changed to: {}%", pct);
             }
         }
         return;
@@ -41,7 +46,7 @@ fn handle_menu_event(app: &tauri::AppHandle, event_id: &str) {
     if let Some(session_id) = event_id.strip_prefix("session_toggle_") {
         // 必须用 app.emit 广播，window.emit 前端 listen 收不到
         let _ = app.emit("toggle-session", session_id.to_string());
-        log::info!("Session visibility toggled: {}", session_id);
+        tracing::info!("Session visibility toggled: {}", session_id);
         return;
     }
 
@@ -49,12 +54,28 @@ fn handle_menu_event(app: &tauri::AppHandle, event_id: &str) {
     if let Some(size_str) = event_id.strip_prefix("label_size_") {
         if let Ok(size) = size_str.parse::<u32>() {
             let _ = app.emit("change-label-size", size);
-            log::info!("Label size changed to: {}", size);
+            tracing::info!("Label size changed to: {}", size);
         }
         return;
     }
 
     match event_id {
+        "status" => {
+            if let Some(w) = app.get_webview_window("status") {
+                let _ = w.show();
+                let _ = w.set_focus();
+            } else {
+                let _w = tauri::WebviewWindowBuilder::new(
+                    app,
+                    "status",
+                    tauri::WebviewUrl::App("/status".into()),
+                )
+                .title("Claude Code 状态")
+                .inner_size(400.0, 520.0)
+                .resizable(true)
+                .build();
+            }
+        }
         "settings" => {
             // 如果设置窗口已存在，直接聚焦
             if let Some(w) = app.get_webview_window("preference") {
@@ -132,17 +153,28 @@ fn screen_for_mouse() -> objc2_foundation::NSRect {
 }
 
 /// macOS: 后台轮询光标位置，动态切换窗口穿透 + 跨屏跟随
+/// 自适应频率：光标靠近宠物时 32ms，远离时 150ms，节省 CPU
 #[cfg(target_os = "macos")]
 fn start_passthrough_tracking(window: tauri::WebviewWindow) {
     // 初始状态：穿透
     let _ = window.set_ignore_cursor_events(true);
 
+    const FAST_INTERVAL_MS: u64 = 32;   // 光标在附近时的高频检测
+    const SLOW_INTERVAL_MS: u64 = 150;  // 光标远离时的低频检测
+    const PROXIMITY_PX: f64 = 80.0;     // "附近"的判定距离（逻辑点）
+
     tauri::async_runtime::spawn(async move {
         let mut cursor_over = false;
+        let mut cursor_near = false;
         let mut last_screen = screen_for_mouse();
 
         loop {
-            tokio::time::sleep(std::time::Duration::from_millis(32)).await;
+            let interval = if cursor_over || cursor_near {
+                FAST_INTERVAL_MS
+            } else {
+                SLOW_INTERVAL_MS
+            };
+            tokio::time::sleep(std::time::Duration::from_millis(interval)).await;
 
             // —— 屏幕切换检测 ——
             let cur_screen = screen_for_mouse();
@@ -172,7 +204,7 @@ fn start_passthrough_tracking(window: tauri::WebviewWindow) {
                     let new_y = cur_screen.origin.y + rel_y * (cur_screen.size.height - wh);
 
                     let _ = window.set_position(tauri::LogicalPosition::new(new_x, new_y));
-                    log::info!(
+                    tracing::info!(
                         "Pet moved to screen at ({}, {}), size {}x{}",
                         cur_screen.origin.x,
                         cur_screen.origin.y,
@@ -183,12 +215,15 @@ fn start_passthrough_tracking(window: tauri::WebviewWindow) {
                 last_screen = cur_screen;
             }
 
-            // —— 光标穿透检测 ——
+            // —— 光标穿透检测 + 距离检测 ——
             let over = is_cursor_over_pet(&window);
             if over != cursor_over {
                 cursor_over = over;
                 let _ = window.set_ignore_cursor_events(!over);
             }
+
+            // 判断光标是否在宠物附近（用于自适应频率）
+            cursor_near = is_cursor_near_pet(&window, PROXIMITY_PX);
         }
     });
 }
@@ -231,8 +266,39 @@ fn is_cursor_over_pet(window: &tauri::WebviewWindow) -> bool {
         && cursor.y <= win_top_ns - mt
 }
 
+/// 判断光标是否在宠物窗口附近（扩大判定范围，用于自适应轮询频率）
+#[cfg(target_os = "macos")]
+fn is_cursor_near_pet(window: &tauri::WebviewWindow, proximity: f64) -> bool {
+    use objc2_app_kit::NSEvent;
+
+    let cursor = NSEvent::mouseLocation();
+    let screen_frame = screen_for_mouse();
+    let screen_h: f64 = screen_frame.origin.y + screen_frame.size.height;
+
+    let Ok(pos) = window.outer_position() else { return false };
+    let Ok(size) = window.outer_size() else { return false };
+    let sf = window.scale_factor().unwrap_or(1.0);
+
+    let wx = pos.x as f64 / sf;
+    let wy_top = pos.y as f64 / sf;
+    let ww = size.width as f64 / sf;
+    let wh = size.height as f64 / sf;
+
+    let win_top_ns = screen_h - wy_top;
+    let win_bottom_ns = win_top_ns - wh;
+
+    // 扩大检测区域
+    cursor.x >= wx - proximity
+        && cursor.x <= wx + ww + proximity
+        && cursor.y >= win_bottom_ns - proximity
+        && cursor.y <= win_top_ns + proximity
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // 初始化 tracing 日志系统，guard 必须持有到进程结束
+    let _log_guard = logging::init().expect("failed to init logging");
+
     tauri::Builder::default()
         .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
             if let Some(window) = app.get_webview_window("main") {
@@ -240,8 +306,10 @@ pub fn run() {
                 let _ = window.set_focus();
             }
         }))
-        .plugin(tauri_plugin_log::Builder::new().build())
+        .plugin(tauri_plugin_notification::init())
         .manage(WatcherState::new())
+        .manage(Arc::new(PendingRequests::new()))
+        .manage(config::shared())
         .manage({
             let mut mgr = SessionManager::new();
             mgr.scan_existing_sessions();
@@ -270,6 +338,16 @@ pub fn run() {
             commands::check_pretooluse_hook_status,
             commands::set_intercept_active,
             commands::get_intercept_active,
+            commands::check_claude_cli,
+            commands::claude_ask,
+            commands::open_status_panel,
+            commands::open_log_dir,
+            commands::verify_hook_integrity,
+            commands::get_config,
+            commands::update_config,
+            commands::read_recent_logs,
+            commands::collect_diagnostics,
+            commands::check_health,
         ])
         .setup(|app| {
             // macOS: 通过 NSWindow + WKWebView API 实现完全透明
@@ -278,7 +356,13 @@ pub fn run() {
                 use objc2_app_kit::{NSColor, NSWindow};
 
                 if let Some(window) = app.get_webview_window("main") {
-                    let ns_window = window.ns_window().unwrap();
+                    let ns_window = match window.ns_window() {
+                        Ok(ptr) => ptr,
+                        Err(e) => {
+                            tracing::warn!("Failed to get NSWindow handle: {}", e);
+                            return Ok(());
+                        }
+                    };
                     let ns_window: &NSWindow = unsafe { &*(ns_window as *const NSWindow) };
                     ns_window.setOpaque(false);
                     ns_window.setBackgroundColor(Some(&NSColor::clearColor()));
@@ -296,12 +380,13 @@ pub fn run() {
                         use objc2::runtime::Bool;
 
                         if let Some(content_view) = ns_window.contentView() {
-                            for subview in content_view.subviews().iter() {
-                                let sv: &objc2_app_kit::NSView = &subview;
+                            let subviews: Vec<objc2::rc::Retained<objc2_app_kit::NSView>> = content_view.subviews().to_vec();
+                            for subview in subviews.iter() {
+                                let sv: &objc2_app_kit::NSView = subview;
                                 let responds: Bool = objc2::msg_send![sv, respondsToSelector: sel!(_setDrawsBackground:)];
                                 if responds.as_bool() {
                                     let _: () = objc2::msg_send![sv, _setDrawsBackground: Bool::NO];
-                                    log::info!("Set WKWebView drawsBackground = NO");
+                                    tracing::info!("Set WKWebView drawsBackground = NO");
                                 }
                             }
                         }
@@ -312,14 +397,13 @@ pub fn run() {
                         let screen_frame = screen_for_mouse();
 
                         let win_w = 220.0_f64;
-                        let _win_h = 250.0_f64;
                         let margin = 20.0_f64;
                         let x = screen_frame.size.width - win_w - margin;
                         let y = margin;
 
                         let _ = window.set_position(tauri::LogicalPosition::new(x, y));
                         let _ = window.show();
-                        log::info!(
+                        tracing::info!(
                             "Window positioned at ({}, {}), screen {}x{}",
                             x,
                             y,
@@ -330,7 +414,7 @@ pub fn run() {
 
                     // 启动窗口穿透跟踪
                     start_passthrough_tracking(window);
-                    log::info!("Passthrough tracking started");
+                    tracing::info!("Passthrough tracking started");
                 }
             }
 
@@ -396,15 +480,19 @@ pub fn run() {
             // 启动时自动开始监听 Claude Code
             let app_handle = app.handle().clone();
             let session_mgr = app.state::<Arc<Mutex<SessionManager>>>().inner().clone();
-            match claude::watcher::start_watching(app_handle, session_mgr) {
+            let cfg = app.state::<config::SharedConfig>().inner().clone();
+            match claude::watcher::start_watching(app_handle, session_mgr, cfg) {
                 Ok(debouncer) => {
-                    let state = app.state::<WatcherState>();
-                    let mut guard = state.jsonl_watcher.lock().unwrap();
-                    *guard = Some(debouncer);
-                    log::info!("Claude Code watcher auto-started");
+                    let watcher_state = app.state::<WatcherState>().inner();
+                    if let Ok(mut guard) = watcher_state.jsonl_watcher.lock() {
+                        *guard = Some(debouncer);
+                        tracing::info!("Claude Code watcher auto-started");
+                    } else {
+                        tracing::warn!("Failed to lock jsonl_watcher: poisoned");
+                    }
                 }
                 Err(e) => {
-                    log::warn!("Failed to auto-start watcher: {}", e);
+                    tracing::warn!("Failed to auto-start watcher: {}", e);
                 }
             }
 
@@ -412,13 +500,16 @@ pub fn run() {
             let app_handle = app.handle().clone();
             match claude::watcher::start_signal_watching(app_handle) {
                 Ok(debouncer) => {
-                    let state = app.state::<WatcherState>();
-                    let mut guard = state.signal_watcher.lock().unwrap();
-                    *guard = Some(debouncer);
-                    log::info!("Signal file watcher auto-started");
+                    let watcher_state = app.state::<WatcherState>().inner();
+                    if let Ok(mut guard) = watcher_state.signal_watcher.lock() {
+                        *guard = Some(debouncer);
+                        tracing::info!("Signal file watcher auto-started");
+                    } else {
+                        tracing::warn!("Failed to lock signal_watcher: poisoned");
+                    }
                 }
                 Err(e) => {
-                    log::warn!("Failed to auto-start signal watcher: {}", e);
+                    tracing::warn!("Failed to auto-start signal watcher: {}", e);
                 }
             }
 
@@ -426,17 +517,56 @@ pub fn run() {
             let app_handle = app.handle().clone();
             match claude::permissions::start_permission_watching(app_handle) {
                 Ok(debouncer) => {
-                    let state = app.state::<WatcherState>();
-                    let mut guard = state.permission_watcher.lock().unwrap();
-                    *guard = Some(debouncer);
-                    log::info!("Permission watcher auto-started");
+                    let watcher_state = app.state::<WatcherState>().inner();
+                    if let Ok(mut guard) = watcher_state.permission_watcher.lock() {
+                        *guard = Some(debouncer);
+                        tracing::info!("Permission watcher auto-started");
+                    } else {
+                        tracing::warn!("Failed to lock permission_watcher: poisoned");
+                    }
                 }
                 Err(e) => {
-                    log::warn!("Failed to auto-start permission watcher: {}", e);
+                    tracing::warn!("Failed to auto-start permission watcher: {}", e);
                 }
             }
 
-            log::info!("ClaudePet started");
+            // 启动配置文件热重载
+            {
+                let cfg = app.state::<config::SharedConfig>().inner().clone();
+                let app_handle = app.handle().clone();
+                if let Some(debouncer) = config::start_watching(cfg, app_handle) {
+                    let watcher_state = app.state::<WatcherState>().inner();
+                    // 复用 signal_watcher 不太合理，但 WatcherState 只有 3 个 slot
+                    // 这里用一个 leak 让 debouncer 存活到进程结束
+                    std::mem::forget(debouncer);
+                    tracing::info!("Config file watcher started");
+                }
+            }
+
+            // 启动 IPC socket server
+            {
+                let app_handle = app.handle().clone();
+                let pending = app.state::<Arc<PendingRequests>>().inner().clone();
+                tauri::async_runtime::spawn(async move {
+                    if let Err(e) = claude::ipc::serve(app_handle, pending).await {
+                        tracing::error!("IPC socket server error: {}", e);
+                    }
+                });
+            }
+
+            // 启动时自检 hook 完整性（孤儿清理 + 版本校验）
+            claude::settings::verify_hook_integrity();
+
+            // 清理启动前残留的过期权限文件，并启动定期清理
+            claude::permissions::cleanup_stale_files();
+            std::thread::spawn(|| {
+                loop {
+                    std::thread::sleep(std::time::Duration::from_secs(60));
+                    claude::permissions::cleanup_stale_files();
+                }
+            });
+
+            tracing::info!("ClaudePet started");
             Ok(())
         })
         .run(tauri::generate_context!())

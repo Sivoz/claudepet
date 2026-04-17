@@ -1,6 +1,7 @@
 import { onMounted, onUnmounted, watch } from 'vue'
 import { listen } from '@tauri-apps/api/event'
 import { invoke } from '@tauri-apps/api/core'
+import { INVOKE_KEY } from '@/constant'
 import { useModelStore } from '@/stores/model'
 import { useClaudeStore } from '@/stores/claude'
 import { useCatStore } from '@/stores/cat'
@@ -55,7 +56,7 @@ export function useModel(containerId: string) {
       const scale = pctToScale(pct)
       if (pet) pet.setScale(scale)
       const { width, height } = calcWindowSize(scale)
-      await invoke('resize_window', { width, height })
+      await invoke(INVOKE_KEY.RESIZE_WINDOW, { width, height })
     }))
 
     // 监听镜像切换

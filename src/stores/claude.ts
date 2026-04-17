@@ -1,8 +1,8 @@
-import { ref, watch } from 'vue'
+import { ref } from 'vue'
 import { defineStore } from 'pinia'
+import { loadFromStorage, autoPersist } from '@/utils/storage'
 import type { PetState, ClaudeSession, PermissionRequest } from '@/types/claude'
 
-/** localStorage 持久化 key */
 const STORAGE_KEY = 'claude-pet-settings'
 
 interface PersistedSettings {
@@ -10,20 +10,11 @@ interface PersistedSettings {
   labelSize: number
 }
 
-function loadSettings(): PersistedSettings {
-  try {
-    const raw = localStorage.getItem(STORAGE_KEY)
-    if (raw) return JSON.parse(raw)
-  } catch { /* ignore */ }
-  return { hiddenSessionIds: [], labelSize: 10 }
-}
-
-function saveSettings(settings: PersistedSettings) {
-  localStorage.setItem(STORAGE_KEY, JSON.stringify(settings))
-}
-
 export const useClaudeStore = defineStore('claude', () => {
-  const saved = loadSettings()
+  const saved = loadFromStorage<PersistedSettings>(STORAGE_KEY, {
+    hiddenSessionIds: [],
+    labelSize: 10,
+  })
 
   const petState = ref<PetState>('idle')
   const activeSession = ref<ClaudeSession | null>(null)
@@ -31,17 +22,15 @@ export const useClaudeStore = defineStore('claude', () => {
   const sessions = ref<ClaudeSession[]>([])
   const pendingPermissions = ref<PermissionRequest[]>([])
   const primarySessionId = ref<string | null>(null)
-  // 用数组代替 Set，Vue 3 对数组的响应式追踪更可靠
   const hiddenSessionIds = ref<string[]>(saved.hiddenSessionIds)
   const labelSize = ref(saved.labelSize)
+  const totalTokens = ref(0)
+  const appStartTime = Date.now()
 
-  // 自动持久化
-  watch([hiddenSessionIds, labelSize], () => {
-    saveSettings({
-      hiddenSessionIds: hiddenSessionIds.value,
-      labelSize: labelSize.value,
-    })
-  }, { deep: true })
+  autoPersist(STORAGE_KEY, [hiddenSessionIds, labelSize], () => ({
+    hiddenSessionIds: hiddenSessionIds.value,
+    labelSize: labelSize.value,
+  }))
 
   function setPetState(state: PetState) {
     petState.value = state
@@ -81,6 +70,14 @@ export const useClaudeStore = defineStore('claude', () => {
     )
   }
 
+  function addTokens(input: number, output: number) {
+    totalTokens.value += input + output
+  }
+
+  function resetTokens() {
+    totalTokens.value = 0
+  }
+
   function setPrimarySession(sessionId: string | null) {
     primarySessionId.value = sessionId
   }
@@ -117,5 +114,9 @@ export const useClaudeStore = defineStore('claude', () => {
     toggleSessionVisibility,
     isSessionVisible,
     labelSize,
+    totalTokens,
+    addTokens,
+    resetTokens,
+    appStartTime,
   }
 })

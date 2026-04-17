@@ -8,6 +8,8 @@ use tauri::menu::{CheckMenuItem, IsMenuItem, Menu, MenuItem, PredefinedMenuItem,
 use crate::claude::watcher;
 use crate::claude::settings;
 use crate::claude::permissions;
+use crate::claude::ipc::{self, PendingRequests};
+use crate::claude::cli;
 use crate::claude::session::SessionManager;
 use crate::claude::PetState;
 
@@ -41,6 +43,7 @@ pub fn start_watcher(
     app: tauri::AppHandle,
     state: tauri::State<WatcherState>,
     session_mgr: tauri::State<Arc<Mutex<SessionManager>>>,
+    config: tauri::State<crate::config::SharedConfig>,
 ) -> Result<(), String> {
     let mut guard = state.jsonl_watcher.lock().map_err(|e| e.to_string())?;
     if guard.is_some() {
@@ -48,9 +51,10 @@ pub fn start_watcher(
     }
 
     let debouncer =
-        watcher::start_watching(app, session_mgr.inner().clone()).map_err(|e| e.to_string())?;
+        watcher::start_watching(app, session_mgr.inner().clone(), config.inner().clone())
+            .map_err(|e| e.to_string())?;
     *guard = Some(debouncer);
-    log::info!("Claude Code watcher started");
+    tracing::info!("Claude Code watcher started");
     Ok(())
 }
 
@@ -58,7 +62,7 @@ pub fn start_watcher(
 pub fn stop_watcher(state: tauri::State<WatcherState>) -> Result<(), String> {
     let mut guard = state.jsonl_watcher.lock().map_err(|e| e.to_string())?;
     if guard.take().is_some() {
-        log::info!("Claude Code watcher stopped");
+        tracing::info!("Claude Code watcher stopped");
     }
     Ok(())
 }
@@ -69,7 +73,7 @@ pub fn resize_window(window: tauri::WebviewWindow, width: f64, height: f64) -> R
     window
         .set_size(LogicalSize::new(width, height))
         .map_err(|e| e.to_string())?;
-    log::info!("Window resized to {}x{}", width, height);
+    tracing::info!("Window resized to {}x{}", width, height);
     Ok(())
 }
 
@@ -93,7 +97,7 @@ pub fn set_skin(app: tauri::AppHandle, skin: String) -> Result<(), String> {
     if let Some(w) = app.get_webview_window("main") {
         w.emit("change-skin", &skin).map_err(|e| e.to_string())?;
     }
-    log::info!("Skin changed to: {}", skin);
+    tracing::info!("Skin changed to: {}", skin);
     Ok(())
 }
 
@@ -103,7 +107,7 @@ pub fn set_scale(app: tauri::AppHandle, pct: u32) -> Result<(), String> {
     if let Some(w) = app.get_webview_window("main") {
         w.emit("change-scale", pct).map_err(|e| e.to_string())?;
     }
-    log::info!("Scale changed to: {}%", pct);
+    tracing::info!("Scale changed to: {}%", pct);
     Ok(())
 }
 
@@ -136,9 +140,20 @@ pub fn get_active_sessions(
 // ---- 权限审批命令 ----
 
 #[tauri::command]
-pub fn respond_permission(request_id: String, decision: String) -> Result<(), String> {
-    permissions::respond(&request_id, &decision, Some("ClaudePet user decision"))
-        .map_err(|e| e.to_string())
+pub async fn respond_permission(
+    request_id: String,
+    decision: String,
+    pending: tauri::State<'_, Arc<PendingRequests>>,
+) -> Result<(), String> {
+    let allow = decision == "allow";
+    let resolved = pending.resolve(&request_id, ipc::Decision { allow }).await;
+
+    if !resolved {
+        // IPC channel 不存在时，fallback 到文件响应（兼容旧 hook 脚本）
+        permissions::respond(&request_id, &decision, Some("ClaudePet user decision"))
+            .map_err(|e| e.to_string())?;
+    }
+    Ok(())
 }
 
 #[tauri::command]
@@ -164,6 +179,148 @@ pub fn set_intercept_active(active: bool) -> Result<(), String> {
 #[tauri::command]
 pub fn get_intercept_active() -> Result<bool, String> {
     Ok(permissions::is_intercept_active())
+}
+
+// ---- CLI 命令 ----
+
+#[tauri::command]
+pub async fn check_claude_cli() -> Result<cli::CliInfo, String> {
+    Ok(cli::check_cli().await)
+}
+
+#[tauri::command]
+pub async fn claude_ask(prompt: String, cwd: Option<String>) -> Result<String, String> {
+    cli::ask(&prompt, cwd.as_deref())
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub fn open_status_panel(app_handle: tauri::AppHandle) {
+    if let Some(w) = app_handle.get_webview_window("status") {
+        let _ = w.show();
+        let _ = w.set_focus();
+    } else {
+        let _ = tauri::WebviewWindowBuilder::new(
+            &app_handle,
+            "status",
+            tauri::WebviewUrl::App("/status".into()),
+        )
+        .title("Claude Code 状态")
+        .inner_size(400.0, 520.0)
+        .resizable(true)
+        .build();
+    }
+}
+
+#[tauri::command]
+pub fn verify_hook_integrity() -> Result<settings::HookHealth, String> {
+    Ok(settings::verify_hook_integrity())
+}
+
+#[tauri::command]
+pub fn open_log_dir() -> Result<(), String> {
+    let log_dir = crate::logging::log_dir().map_err(|e| e.to_string())?;
+    std::fs::create_dir_all(&log_dir).map_err(|e| e.to_string())?;
+    std::process::Command::new("open")
+        .arg(&log_dir)
+        .spawn()
+        .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+#[tauri::command]
+pub fn check_health() -> Result<crate::health::HealthReport, String> {
+    Ok(crate::health::check_all())
+}
+
+#[tauri::command]
+pub fn get_config(
+    config: tauri::State<crate::config::SharedConfig>,
+) -> Result<crate::config::AppConfig, String> {
+    config.read().map(|c| c.clone()).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub fn update_config(
+    config: tauri::State<crate::config::SharedConfig>,
+    new_config: crate::config::AppConfig,
+) -> Result<(), String> {
+    // 写入文件
+    let path = dirs::home_dir()
+        .ok_or("Cannot find home directory")?
+        .join(".claude-pet")
+        .join("config.toml");
+    let content = toml::to_string_pretty(&new_config).map_err(|e| e.to_string())?;
+    let header = "# ClaudePet 配置文件\n# 修改后自动生效，无需重启\n\n";
+    std::fs::write(&path, format!("{}{}", header, content)).map_err(|e| e.to_string())?;
+    // 热重载会通过 file watcher 自动更新 SharedConfig
+    // 但也直接更新以确保即时生效
+    if let Ok(mut guard) = config.write() {
+        *guard = new_config;
+    }
+    Ok(())
+}
+
+/// 读取最近的 warn/error 日志（最多 20 条）
+#[tauri::command]
+pub fn read_recent_logs() -> Result<Vec<String>, String> {
+    let log_dir = crate::logging::log_dir().map_err(|e| e.to_string())?;
+    let mut lines = Vec::new();
+
+    // 读取最新日志文件
+    let mut entries: Vec<_> = std::fs::read_dir(&log_dir)
+        .map_err(|e| e.to_string())?
+        .flatten()
+        .filter(|e| {
+            e.file_name()
+                .to_str()
+                .map(|n| n.starts_with("claudepet.log"))
+                .unwrap_or(false)
+        })
+        .collect();
+    entries.sort_by_key(|e| std::cmp::Reverse(e.file_name()));
+
+    if let Some(latest) = entries.first() {
+        let content = std::fs::read_to_string(latest.path()).map_err(|e| e.to_string())?;
+        for line in content.lines().rev().take(200) {
+            if line.contains("WARN") || line.contains("ERROR") {
+                lines.push(line.to_string());
+                if lines.len() >= 20 {
+                    break;
+                }
+            }
+        }
+        lines.reverse();
+    }
+
+    Ok(lines)
+}
+
+/// 收集诊断信息
+#[tauri::command]
+pub fn collect_diagnostics() -> Result<String, String> {
+    let mut info = String::new();
+    info.push_str(&format!("ClaudePet v{}\n", env!("CARGO_PKG_VERSION")));
+    info.push_str(&format!("OS: {} {}\n", std::env::consts::OS, std::env::consts::ARCH));
+
+    // Rust version
+    info.push_str(&format!("Rust edition: 2021\n"));
+
+    // Hook 状态
+    let hook_health = settings::verify_hook_integrity();
+    info.push_str(&format!("Hook health: {:?}\n", hook_health));
+
+    // 最近日志
+    if let Ok(logs) = read_recent_logs() {
+        info.push_str(&format!("\n--- Recent logs ({} entries) ---\n", logs.len()));
+        for log in &logs {
+            info.push_str(log);
+            info.push('\n');
+        }
+    }
+
+    Ok(info)
 }
 
 /// 皮肤列表
@@ -278,6 +435,8 @@ pub fn build_full_menu(
 
     // 其他项
     let sep = PredefinedMenuItem::separator(app).map_err(|e| e.to_string())?;
+    let status_item = MenuItem::with_id(app, "status", "状态面板…", true, None::<&str>)
+        .map_err(|e| e.to_string())?;
     let settings_item = MenuItem::with_id(app, "settings", "设置…", true, None::<&str>)
         .map_err(|e| e.to_string())?;
     let quit = MenuItem::with_id(app, "quit", "退出", true, None::<&str>)
@@ -286,11 +445,11 @@ pub fn build_full_menu(
     if let Some(session_sub) = &session_sub {
         Menu::with_items(
             app,
-            &[&skin_sub, &size_sub, &label_size_sub, session_sub, &sep, &settings_item, &quit],
+            &[&skin_sub, &size_sub, &label_size_sub, session_sub, &sep, &status_item, &settings_item, &quit],
         )
         .map_err(|e| e.to_string())
     } else {
-        Menu::with_items(app, &[&skin_sub, &size_sub, &label_size_sub, &sep, &settings_item, &quit])
+        Menu::with_items(app, &[&skin_sub, &size_sub, &label_size_sub, &sep, &status_item, &settings_item, &quit])
             .map_err(|e| e.to_string())
     }
 }

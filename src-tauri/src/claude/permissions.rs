@@ -45,7 +45,7 @@ pub fn start_permission_watching(
             let events = match result {
                 Ok(events) => events,
                 Err(e) => {
-                    log::warn!("Permission watcher error: {:?}", e);
+                    tracing::warn!("Permission watcher error: {:?}", e);
                     continue;
                 }
             };
@@ -65,7 +65,7 @@ pub fn start_permission_watching(
                 let content = match std::fs::read_to_string(path) {
                     Ok(c) => c,
                     Err(e) => {
-                        log::warn!("Failed to read permission request {:?}: {}", path, e);
+                        tracing::warn!("Failed to read permission request {:?}: {}", path, e);
                         continue;
                     }
                 };
@@ -73,19 +73,19 @@ pub fn start_permission_watching(
                 let request: PermissionRequest = match serde_json::from_str(&content) {
                     Ok(r) => r,
                     Err(e) => {
-                        log::warn!("Failed to parse permission request {:?}: {}", path, e);
+                        tracing::warn!("Failed to parse permission request {:?}: {}", path, e);
                         continue;
                     }
                 };
 
-                log::info!(
+                tracing::info!(
                     "Permission request received: {} for tool {}",
                     request.request_id,
                     request.tool_name
                 );
 
                 if let Err(e) = app.emit("permission-request", &request) {
-                    log::error!("Failed to emit permission-request: {}", e);
+                    tracing::error!("Failed to emit permission-request: {}", e);
                 }
             }
         }
@@ -97,7 +97,7 @@ pub fn start_permission_watching(
         .watcher()
         .watch(&watch_dir, RecursiveMode::NonRecursive)?;
 
-    log::info!("Watching permission requests at {:?}", requests_dir);
+    tracing::info!("Watching permission requests at {:?}", requests_dir);
 
     Ok(debouncer)
 }
@@ -115,10 +115,12 @@ pub fn respond(request_id: &str, decision: &str, reason: Option<&str>) -> anyhow
     };
 
     let response_path = responses_dir.join(format!("{}.json", request_id));
+    let tmp_path = responses_dir.join(format!("{}.tmp", request_id));
     let content = serde_json::to_string(&response)?;
-    std::fs::write(&response_path, content)?;
+    std::fs::write(&tmp_path, &content)?;
+    std::fs::rename(&tmp_path, &response_path)?;
 
-    log::info!("Permission response written: {} = {}", request_id, decision);
+    tracing::info!("Permission response written: {} = {}", request_id, decision);
     Ok(())
 }
 
@@ -132,10 +134,10 @@ pub fn set_intercept_active(active: bool) -> anyhow::Result<()> {
             std::fs::create_dir_all(parent)?;
         }
         std::fs::write(&flag_path, "1")?;
-        log::info!("Intercept mode activated");
+        tracing::info!("Intercept mode activated");
     } else {
         let _ = std::fs::remove_file(&flag_path);
-        log::info!("Intercept mode deactivated");
+        tracing::info!("Intercept mode deactivated");
     }
 
     Ok(())
